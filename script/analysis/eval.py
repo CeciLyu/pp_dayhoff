@@ -84,6 +84,13 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 DEVICE = "cuda"
 SAVE_EVERY_OG = 5
+# Batch size for model forward. Set this larger than N_SAMPLES_PER_OG to combine
+# multiple conditions in one call when memory allows.
+# set to large to only use token budget for batching, since sample length varies significantly
+MAX_FORWARD_BATCH_SAMPLES = 1000
+# Optional padded-token budget per forward (max_seq_len_in_batch * batch_size).
+# Set to None to disable.
+MAX_FORWARD_BATCH_TOKENS = 200_000
 
 seed_everything(SEED)
 
@@ -240,6 +247,42 @@ def build_padded_batch(
     return input_ids, attention_mask
 
 
+def iter_context_chunks(
+    sample_contexts: list[dict],
+    max_batch_samples: int,
+    max_batch_tokens: int | None = None,
+):
+    """
+    Yield context chunks sized for efficient padded batching.
+    Chunks are length-sorted to reduce padding waste.
+    """
+    if len(sample_contexts) == 0:
+        return
+
+    sorted_contexts = sorted(sample_contexts, key=lambda x: x["input_len"])
+    chunk = []
+    chunk_max_len = 0
+    for sample in sorted_contexts:
+        sample_len = sample["input_len"]
+        next_max_len = max(chunk_max_len, sample_len)
+        next_batch_size = len(chunk) + 1
+        exceeds_samples = next_batch_size > max_batch_samples
+        exceeds_tokens = max_batch_tokens is not None and (
+            next_max_len * next_batch_size > max_batch_tokens
+        )
+
+        if chunk and (exceeds_samples or exceeds_tokens):
+            yield chunk
+            chunk = [sample]
+            chunk_max_len = sample_len
+        else:
+            chunk.append(sample)
+            chunk_max_len = next_max_len
+
+    if chunk:
+        yield chunk
+
+
 def hidden_idx_to_hook_layer(layer_idx: int, n_model_layers: int) -> int:
     """
     hidden_states[k] (k>0) corresponds to output of model.model.layers[k-1].
@@ -269,36 +312,12 @@ def probe_on_last_protein_hidden(
 
 
 @torch.inference_mode()
-def get_last_protein_hidden_for_samples_batched(
+def extract_last_protein_hidden_for_contexts(
     model: torch.nn.Module,
-    protein_names: list,
-    rank_ids: list,
-    seqs: list,
-    tokenizer: PureARTokenizer,
-    n_samples: int,
+    sample_contexts: list[dict],
     pad_token_id: int,
-    src_rank_id: int | None = None,
-    tgt_rank_id: int | None = None,
-    rank_to_indices: dict | None = None,
-    layers: list | None = None,
-) -> list[tuple]:
-    if layers is None:
-        raise ValueError("`layers` must be provided")
-
-    sample_contexts = []
-    for _ in range(n_samples):
-        sample = sample_context_for_og(
-            protein_names=protein_names,
-            rank_ids=rank_ids,
-            seqs=seqs,
-            tokenizer=tokenizer,
-            src_rank_id=src_rank_id,
-            tgt_rank_id=tgt_rank_id,
-            rank_to_indices=rank_to_indices,
-        )
-        if sample is not None:
-            sample_contexts.append(sample)
-
+    layers: list,
+) -> list[list[torch.Tensor]]:
     if not sample_contexts:
         return []
 
@@ -362,13 +381,7 @@ def get_last_protein_hidden_for_samples_batched(
             hidden = last_hidden_by_layer[layer_idx]
             last_hidden = hidden[bidx, seq_len - last_protein_len : seq_len, :]
             last_protein_hiddens.append(last_hidden)
-        outputs.append(
-            (
-                sample["protein_names"],
-                last_protein_hiddens,
-                sample["rank_ids"],
-            )
-        )
+        outputs.append(last_protein_hiddens)
     return outputs
 
 
@@ -441,24 +454,54 @@ def main():
                 rank_to_indices[rank_id].append(idx)
             n_classes = len(set(c for c in rank_ids if c is not None))
             if n_classes < 2:
-                sample_outputs = get_last_protein_hidden_for_samples_batched(
-                    model,
-                    row.protein,
-                    rank_ids,
-                    row.seq,
-                    tokenizer,
-                    n_samples=N_SAMPLES_PER_OG,
+                condition_pairs = [(None, None)]
+                n_conditions = 1
+            else:
+                unique_rank_ids = set(c for c in rank_ids if c is not None)
+                condition_pairs = list(itertools.product(unique_rank_ids, repeat=2))
+                n_conditions = len(unique_rank_ids) ** 2
+
+            all_sample_contexts = []
+            for src_rank_id, tgt_rank_id in tqdm(
+                condition_pairs,
+                desc="Sampling contexts",
+                total=n_conditions,
+                leave=False,
+            ):
+                for _ in range(N_SAMPLES_PER_OG):
+                    sample = sample_context_for_og(
+                        protein_names=row.protein,
+                        rank_ids=rank_ids,
+                        seqs=row.seq,
+                        tokenizer=tokenizer,
+                        src_rank_id=src_rank_id,
+                        tgt_rank_id=tgt_rank_id,
+                        rank_to_indices=rank_to_indices,
+                    )
+                    if sample is None:
+                        break
+                    sample["src_rank_id"] = src_rank_id
+                    sample["tgt_rank_id"] = tgt_rank_id
+                    all_sample_contexts.append(sample)
+
+            total_sample_length = sum(s["input_len"] for s in all_sample_contexts)
+            for sample_chunk in tqdm(
+                iter_context_chunks(
+                    all_sample_contexts,
+                    max_batch_samples=MAX_FORWARD_BATCH_SAMPLES,
+                    max_batch_tokens=MAX_FORWARD_BATCH_TOKENS,
+                ),
+                desc="Processing batches",
+                leave=False,
+                total=(total_sample_length // MAX_FORWARD_BATCH_TOKENS + 1),
+            ):
+                chunk_hiddens = extract_last_protein_hidden_for_contexts(
+                    model=model,
+                    sample_contexts=sample_chunk,
                     pad_token_id=pad_token_id,
-                    src_rank_id=None,
-                    tgt_rank_id=None,
-                    rank_to_indices=rank_to_indices,
                     layers=layers_for_rank,
                 )
-                for (
-                    protein_names,
-                    last_protein_hiddens,
-                    rank_ids_sampled,
-                ) in sample_outputs:
+                for sample, last_protein_hiddens in zip(sample_chunk, chunk_hiddens):
                     # run probe on last protein hidden
                     for layer_idx, last_protein_hidden in zip(
                         layers_for_rank, last_protein_hiddens
@@ -471,61 +514,14 @@ def main():
                             {
                                 "og": row.og,
                                 "rank": rank,
-                                "protein_names": protein_names,
-                                "rank_ids": rank_ids_sampled,
+                                "protein_names": sample["protein_names"],
+                                "rank_ids": sample["rank_ids"],
                                 "layer": layer_idx,
-                                "src_rank_id": None,
-                                "tgt_rank_id": None,
+                                "src_rank_id": sample["src_rank_id"],
+                                "tgt_rank_id": sample["tgt_rank_id"],
                                 "pred_tgt_rank_id": pred_tgt_rank_id,
                             }
                         )
-            else:
-                # for each pair of classes in this OG, sample proteins and run probe
-                unique_rank_ids = set(c for c in rank_ids if c is not None)
-                # show inner loop progress with another tqdm bar
-                for src_rank_id, tgt_rank_id in tqdm(
-                    itertools.product(unique_rank_ids, repeat=2),
-                    total=n_classes**2,
-                    desc="Sampling class pairs for evaluation",
-                ):
-                    sample_outputs = get_last_protein_hidden_for_samples_batched(
-                        model,
-                        row.protein,
-                        rank_ids,
-                        row.seq,
-                        tokenizer,
-                        n_samples=N_SAMPLES_PER_OG,
-                        pad_token_id=pad_token_id,
-                        src_rank_id=src_rank_id,
-                        tgt_rank_id=tgt_rank_id,
-                        rank_to_indices=rank_to_indices,
-                        layers=layers_for_rank,
-                    )
-                    for (
-                        protein_names,
-                        last_protein_hiddens,
-                        rank_ids_sampled,
-                    ) in sample_outputs:
-                        # run probe on last protein hidden
-                        for layer_idx, last_protein_hidden in zip(
-                            layers_for_rank, last_protein_hiddens
-                        ):
-                            probe = all_probes[rank][layer_idx]
-                            pred_tgt_rank_id = probe_on_last_protein_hidden(
-                                probe, last_protein_hidden
-                            )
-                            rank_results.append(
-                                {
-                                    "og": row.og,
-                                    "rank": rank,
-                                    "protein_names": protein_names,
-                                    "rank_ids": rank_ids_sampled,
-                                    "layer": layer_idx,
-                                    "src_rank_id": src_rank_id,
-                                    "tgt_rank_id": tgt_rank_id,
-                                    "pred_tgt_rank_id": pred_tgt_rank_id,
-                                }
-                            )
             n_new_og_results += 1
             if n_new_og_results % SAVE_EVERY_OG == 0:
                 with open(output_path, "wb") as f:
