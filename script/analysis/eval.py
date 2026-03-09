@@ -11,6 +11,7 @@ Save per position accuracy.
 import itertools
 import os
 import pickle
+import argparse
 import torch
 import torch.nn.functional as F
 import random
@@ -20,13 +21,8 @@ from pathlib import Path
 from collections import defaultdict
 
 from deimm.model.tokenizer import PureARTokenizer
-from deimm.utils.training_utils import (
-    load_convert_parent,
-    seed_everything,
-)
 from deimm.utils.constants import (
     MSA_PAD,
-    PROTEIN_SEP,
     RANK,
     PRETRAIN_DIR,
 )
@@ -98,10 +94,18 @@ MAX_CONDITION_PAIRS_PER_OG = 1000
 # If set, samples per condition are reduced to fit this budget.
 MAX_TOTAL_SAMPLES_PER_OG = 3000
 
-seed_everything(SEED)
+
+def seed_everything_local(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+
+
+seed_everything_local(SEED)
 
 
 def load_dayhoff_model_tokenizer() -> tuple[torch.nn.Module, PureARTokenizer]:
+    from deimm.utils.training_utils import load_convert_parent
+
     tokenizer_config = {
         "vocab_path": "vocab_UL_ALPHABET_PLUS.txt",
         "allow_unk": False,
@@ -150,6 +154,149 @@ def load_taxonomy_mapping(
             if rank in rank_dict:
                 rank_mapping[rank][int(species_tid)] = int(rank_dict[rank])
     return rank_mapping
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Probe evaluation for Dayhoff/Jamba.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Estimate runtime/workload without loading model or running forward passes.",
+    )
+    parser.add_argument(
+        "--max-minutes-per-og",
+        type=float,
+        default=2.0,
+        help="Observed max minutes per OG under current cap settings (used for estimates).",
+    )
+    return parser.parse_args()
+
+
+def format_minutes(minutes: float) -> str:
+    total_seconds = int(round(minutes * 60))
+    hours, rem = divmod(total_seconds, 3600)
+    mins, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours}h {mins}m {secs}s"
+    if mins > 0:
+        return f"{mins}m {secs}s"
+    return f"{secs}s"
+
+
+def get_completed_ogs_for_rank(output_path: Path, rank: str) -> set:
+    if not output_path.exists():
+        return set()
+    with open(output_path, "rb") as f:
+        loaded_results = pickle.load(f)
+    return {r["og"] for r in loaded_results if r.get("rank") == rank}
+
+
+def compute_sampling_budget(n_classes: int) -> tuple[int, int, bool]:
+    """
+    Returns:
+        condition_pairs_used, samples_per_condition, hit_max_setting
+    """
+    raw_condition_pairs = 1 if n_classes < 2 else n_classes * n_classes
+    condition_pairs_used = raw_condition_pairs
+    pair_cap_hit = False
+    if (
+        MAX_CONDITION_PAIRS_PER_OG is not None
+        and condition_pairs_used > MAX_CONDITION_PAIRS_PER_OG
+    ):
+        condition_pairs_used = MAX_CONDITION_PAIRS_PER_OG
+        pair_cap_hit = True
+
+    samples_per_condition = N_SAMPLES_PER_OG
+    if MAX_TOTAL_SAMPLES_PER_OG is not None:
+        samples_per_condition = min(
+            N_SAMPLES_PER_OG,
+            max(1, MAX_TOTAL_SAMPLES_PER_OG // max(1, condition_pairs_used)),
+        )
+
+    # "Max setting reached" means one of the caps actively constrained work.
+    total_cap_hit = False
+    if MAX_TOTAL_SAMPLES_PER_OG is not None:
+        total_cap_hit = condition_pairs_used * samples_per_condition >= MAX_TOTAL_SAMPLES_PER_OG
+    hit_max_setting = pair_cap_hit or total_cap_hit
+    return condition_pairs_used, samples_per_condition, hit_max_setting
+
+
+def run_dry_run(
+    meta_grouped_test: pd.DataFrame,
+    taxid_to_rank: dict[str, dict[int, int]],
+    max_minutes_per_og: float,
+) -> None:
+    print("=== Dry Run: Runtime Estimate ===")
+    print(f"Assumed max per-OG runtime: {max_minutes_per_og:.2f} min")
+    print(
+        "Caps: "
+        f"MAX_CONDITION_PAIRS_PER_OG={MAX_CONDITION_PAIRS_PER_OG}, "
+        f"MAX_TOTAL_SAMPLES_PER_OG={MAX_TOTAL_SAMPLES_PER_OG}"
+    )
+
+    total_pending = 0
+    total_hit_max = 0
+    total_weighted_minutes = 0.0
+    total_hitmax_minutes = 0.0
+    total_worstcase_minutes = 0.0
+
+    for rank in RANKS_TO_PROBE:
+        if rank not in LAYER_PROBE_MAP:
+            continue
+        layers_for_rank = [lyr for lyr in STEER_LAYERS if lyr in LAYER_PROBE_MAP[rank]]
+        if not layers_for_rank:
+            continue
+
+        output_path = OUTPUT_DIR / f"probe_taxon_per_pos_test_results_{rank}.pkl"
+        completed_ogs = get_completed_ogs_for_rank(output_path, rank)
+
+        pending_work = []
+        hit_max_count = 0
+        for row in meta_grouped_test.itertuples(index=False):
+            if row.og in completed_ogs:
+                continue
+            rank_ids = [taxid_to_rank[rank].get(tid, None) for tid in row.taxid]
+            n_classes = len(set(c for c in rank_ids if c is not None))
+            n_pairs, samples_per_condition, hit_max_setting = compute_sampling_budget(
+                n_classes
+            )
+            total_contexts = n_pairs * samples_per_condition
+            pending_work.append(total_contexts)
+            if hit_max_setting:
+                hit_max_count += 1
+
+        pending_count = len(pending_work)
+        if pending_count == 0:
+            print(f"[{rank}] pending_ogs=0 (already complete)")
+            continue
+
+        max_contexts = max(pending_work)
+        weighted_minutes = sum(
+            (contexts / max_contexts) * max_minutes_per_og for contexts in pending_work
+        )
+        hitmax_minutes = hit_max_count * max_minutes_per_og
+        worstcase_minutes = pending_count * max_minutes_per_og
+
+        print(
+            f"[{rank}] pending_ogs={pending_count}, "
+            f"hit_max_setting={hit_max_count}, "
+            f"max_contexts={max_contexts}, "
+            f"weighted_est={format_minutes(weighted_minutes)}, "
+            f"hitmax_only={format_minutes(hitmax_minutes)}, "
+            f"worst_case={format_minutes(worstcase_minutes)}"
+        )
+
+        total_pending += pending_count
+        total_hit_max += hit_max_count
+        total_weighted_minutes += weighted_minutes
+        total_hitmax_minutes += hitmax_minutes
+        total_worstcase_minutes += worstcase_minutes
+
+    print("\n=== Total Estimate ===")
+    print(f"pending_ogs={total_pending}, hit_max_setting={total_hit_max}")
+    print(f"weighted_estimate={format_minutes(total_weighted_minutes)}")
+    print(f"hitmax_only_estimate={format_minutes(total_hitmax_minutes)}")
+    print(f"worst_case_estimate={format_minutes(total_worstcase_minutes)}")
 
 
 def sample_proteins_for_og(
@@ -392,12 +539,24 @@ def extract_last_protein_hidden_for_contexts(
 
 
 def main():
+    args = parse_args()
+    # Load taxonomy mapping
+    taxid_to_rank = load_taxonomy_mapping(TAXONOMY_MAPPING_FILE, RANKS_TO_PROBE)
+    # Load test data
+    meta_grouped_test = pd.read_parquet(TEST_FPATH)
+    print(f"Loaded test data with {len(meta_grouped_test)} orthologous groups")
+
+    if args.dry_run:
+        run_dry_run(
+            meta_grouped_test=meta_grouped_test,
+            taxid_to_rank=taxid_to_rank,
+            max_minutes_per_og=args.max_minutes_per_og,
+        )
+        return
+
     # Load model and tokenizer
     model, tokenizer = load_dayhoff_model_tokenizer()
     pad_token_id = tokenizer(MSA_PAD)
-
-    # Load taxonomy mapping
-    taxid_to_rank = load_taxonomy_mapping(TAXONOMY_MAPPING_FILE, RANKS_TO_PROBE)
 
     # Load probes
     all_probes = {}  # {rank: {layer: probe_dict}}
@@ -413,10 +572,6 @@ def main():
                 all_probes[rank][layer_idx] = load_linear_probe(path)
             else:
                 print(f"  WARNING: {path} not found")
-
-    # Load test data
-    meta_grouped_test = pd.read_parquet(TEST_FPATH)
-    print(f"Loaded test data with {len(meta_grouped_test)} orthologous groups")
 
     # loop through meta_grouped_test
     for rank in RANKS_TO_PROBE:
@@ -459,24 +614,17 @@ def main():
             for idx, rank_id in enumerate(rank_ids):
                 rank_to_indices[rank_id].append(idx)
             n_classes = len(set(c for c in rank_ids if c is not None))
+            n_condition_pairs_used, samples_per_condition, _ = compute_sampling_budget(
+                n_classes
+            )
             if n_classes < 2:
                 condition_pairs = [(None, None)]
             else:
                 unique_rank_ids = set(c for c in rank_ids if c is not None)
                 condition_pairs = list(itertools.product(unique_rank_ids, repeat=2))
-                if (
-                    MAX_CONDITION_PAIRS_PER_OG is not None
-                    and len(condition_pairs) > MAX_CONDITION_PAIRS_PER_OG
-                ):
+                if len(condition_pairs) > n_condition_pairs_used:
                     random.shuffle(condition_pairs)
-                    condition_pairs = condition_pairs[:MAX_CONDITION_PAIRS_PER_OG]
-
-            samples_per_condition = N_SAMPLES_PER_OG
-            if MAX_TOTAL_SAMPLES_PER_OG is not None:
-                samples_per_condition = min(
-                    N_SAMPLES_PER_OG,
-                    max(1, MAX_TOTAL_SAMPLES_PER_OG // max(1, len(condition_pairs))),
-                )
+                    condition_pairs = condition_pairs[:n_condition_pairs_used]
 
             all_sample_contexts = []
             for src_rank_id, tgt_rank_id in condition_pairs:
@@ -496,16 +644,10 @@ def main():
                     sample["tgt_rank_id"] = tgt_rank_id
                     all_sample_contexts.append(sample)
 
-            total_sample_length = sum(s["input_len"] for s in all_sample_contexts)
-            for sample_chunk in tqdm(
-                iter_context_chunks(
-                    all_sample_contexts,
-                    max_batch_samples=MAX_FORWARD_BATCH_SAMPLES,
-                    max_batch_tokens=MAX_FORWARD_BATCH_TOKENS,
-                ),
-                desc="Processing batches",
-                leave=False,
-                total=(total_sample_length // MAX_FORWARD_BATCH_TOKENS + 1),
+            for sample_chunk in iter_context_chunks(
+                all_sample_contexts,
+                max_batch_samples=MAX_FORWARD_BATCH_SAMPLES,
+                max_batch_tokens=MAX_FORWARD_BATCH_TOKENS,
             ):
                 chunk_hiddens = extract_last_protein_hidden_for_contexts(
                     model=model,
