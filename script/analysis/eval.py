@@ -91,6 +91,12 @@ MAX_FORWARD_BATCH_SAMPLES = 1000
 # Optional padded-token budget per forward (max_seq_len_in_batch * batch_size).
 # Set to None to disable.
 MAX_FORWARD_BATCH_TOKENS = 200_000
+# Optional cap on number of (src_rank_id, tgt_rank_id) pairs per OG.
+# Helps avoid quadratic blowups for OGs with many classes.
+MAX_CONDITION_PAIRS_PER_OG = 1000
+# Optional cap on total sampled contexts per OG after pair expansion.
+# If set, samples per condition are reduced to fit this budget.
+MAX_TOTAL_SAMPLES_PER_OG = 3000
 
 seed_everything(SEED)
 
@@ -455,20 +461,26 @@ def main():
             n_classes = len(set(c for c in rank_ids if c is not None))
             if n_classes < 2:
                 condition_pairs = [(None, None)]
-                n_conditions = 1
             else:
                 unique_rank_ids = set(c for c in rank_ids if c is not None)
                 condition_pairs = list(itertools.product(unique_rank_ids, repeat=2))
-                n_conditions = len(unique_rank_ids) ** 2
+                if (
+                    MAX_CONDITION_PAIRS_PER_OG is not None
+                    and len(condition_pairs) > MAX_CONDITION_PAIRS_PER_OG
+                ):
+                    random.shuffle(condition_pairs)
+                    condition_pairs = condition_pairs[:MAX_CONDITION_PAIRS_PER_OG]
+
+            samples_per_condition = N_SAMPLES_PER_OG
+            if MAX_TOTAL_SAMPLES_PER_OG is not None:
+                samples_per_condition = min(
+                    N_SAMPLES_PER_OG,
+                    max(1, MAX_TOTAL_SAMPLES_PER_OG // max(1, len(condition_pairs))),
+                )
 
             all_sample_contexts = []
-            for src_rank_id, tgt_rank_id in tqdm(
-                condition_pairs,
-                desc="Sampling contexts",
-                total=n_conditions,
-                leave=False,
-            ):
-                for _ in range(N_SAMPLES_PER_OG):
+            for src_rank_id, tgt_rank_id in condition_pairs:
+                for _ in range(samples_per_condition):
                     sample = sample_context_for_og(
                         protein_names=row.protein,
                         rank_ids=rank_ids,
