@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//scratch/suyuelyu/deimm/deimm/.venv/lib/python3.11/site-packages/transformers/models/jamba/**)"
+    ]
+  }
+}
