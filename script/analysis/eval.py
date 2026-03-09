@@ -10,21 +10,14 @@ Save per position accuracy.
 
 import itertools
 import os
-import re
 import pickle
-import time
 import torch
 import torch.nn.functional as F
 import random
-import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from pathlib import Path
 from collections import defaultdict
-from Bio.Align import PairwiseAligner, substitution_matrices
-from Bio import SeqIO
-from Bio.Seq import Seq
-from Bio.SeqRecord import SeqRecord
 
 from deimm.model.tokenizer import PureARTokenizer
 from deimm.utils.training_utils import (
@@ -194,6 +187,59 @@ def sample_proteins_for_og(
     return idxs_sampled
 
 
+def sample_context_for_og(
+    protein_names: list,
+    rank_ids: list,
+    seqs: list,
+    tokenizer: PureARTokenizer,
+    src_rank_id: int | None = None,
+    tgt_rank_id: int | None = None,
+    rank_to_indices: dict | None = None,
+) -> dict | None:
+    idxs = sample_proteins_for_og(
+        rank_ids=rank_ids,
+        src_rank_id=src_rank_id,
+        tgt_rank_id=tgt_rank_id,
+        rank_to_indices=rank_to_indices,
+    )
+    if idxs is None:
+        return None
+
+    seqs_sampled = [seqs[i] for i in idxs]
+    input_ids = tokenizer.tokenize_multi_proteins(
+        proteins=seqs_sampled, flipped=False, add_sep=False, return_list=False
+    )[:-1]
+    return {
+        "protein_names": [protein_names[i] for i in idxs],
+        "rank_ids": [rank_ids[i] for i in idxs],
+        "input_ids": input_ids,
+        "input_len": int(input_ids.shape[0]),
+        "last_protein_len": len(seqs_sampled[-1]),
+    }
+
+
+def build_padded_batch(
+    sample_contexts: list[dict], pad_token_id: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if len(sample_contexts) == 0:
+        raise ValueError("Cannot build padded batch from empty contexts")
+
+    batch_size = len(sample_contexts)
+    max_len = max(s["input_len"] for s in sample_contexts)
+    input_ids = torch.full(
+        (batch_size, max_len), pad_token_id, dtype=torch.long, device=DEVICE
+    )
+    attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long, device=DEVICE)
+
+    for i, sample in enumerate(sample_contexts):
+        seq_len = sample["input_len"]
+        sample_ids = sample["input_ids"].to(DEVICE)
+        input_ids[i, :seq_len] = sample_ids
+        attention_mask[i, :seq_len] = 1
+
+    return input_ids, attention_mask
+
+
 def hidden_idx_to_hook_layer(layer_idx: int, n_model_layers: int) -> int:
     """
     hidden_states[k] (k>0) corresponds to output of model.model.layers[k-1].
@@ -223,42 +269,40 @@ def probe_on_last_protein_hidden(
 
 
 @torch.inference_mode()
-def get_last_protein_hidden_for_sample(
+def get_last_protein_hidden_for_samples_batched(
     model: torch.nn.Module,
     protein_names: list,
     rank_ids: list,
     seqs: list,
     tokenizer: PureARTokenizer,
+    n_samples: int,
+    pad_token_id: int,
     src_rank_id: int | None = None,
     tgt_rank_id: int | None = None,
     rank_to_indices: dict | None = None,
     layers: list | None = None,
-) -> tuple:
-    # if above 64, downsample to 64
-    idxs = sample_proteins_for_og(
-        rank_ids,
-        src_rank_id,
-        tgt_rank_id,
-        rank_to_indices=rank_to_indices,
-    )
-    if idxs is None:
-        return None, None, None
-    seqs = [seqs[i] for i in idxs]
-    protein_names = [protein_names[i] for i in idxs]
-    rank_ids = [rank_ids[i] for i in idxs]
-
-    last_protein_len = len(seqs[-1])
-
-    input_ids = (
-        tokenizer.tokenize_multi_proteins(
-            proteins=seqs, flipped=False, add_sep=False, return_list=False
-        )[:-1]
-        .unsqueeze(0)
-        .to(DEVICE)
-    )
-
+) -> list[tuple]:
     if layers is None:
         raise ValueError("`layers` must be provided")
+
+    sample_contexts = []
+    for _ in range(n_samples):
+        sample = sample_context_for_og(
+            protein_names=protein_names,
+            rank_ids=rank_ids,
+            seqs=seqs,
+            tokenizer=tokenizer,
+            src_rank_id=src_rank_id,
+            tgt_rank_id=tgt_rank_id,
+            rank_to_indices=rank_to_indices,
+        )
+        if sample is not None:
+            sample_contexts.append(sample)
+
+    if not sample_contexts:
+        return []
+
+    input_ids, attention_mask = build_padded_batch(sample_contexts, pad_token_id)
 
     # Use Jamba backbone directly to avoid LM head logits computation.
     # Capture only requested hidden states via hooks instead of materializing all layers.
@@ -288,6 +332,7 @@ def get_last_protein_hidden_for_sample(
 
             output = backbone(
                 input_ids=input_ids,
+                attention_mask=attention_mask,
                 use_cache=False,
                 output_hidden_states=False,
                 return_dict=True,
@@ -298,9 +343,9 @@ def get_last_protein_hidden_for_sample(
             for h in hooks:
                 h.remove()
     else:
-        # Fallback for non-Jamba models.
         output = model(
             input_ids=input_ids,
+            attention_mask=attention_mask,
             use_cache=False,
             output_hidden_states=True,
             return_dict=True,
@@ -308,17 +353,29 @@ def get_last_protein_hidden_for_sample(
         for layer_idx in layers:
             last_hidden_by_layer[layer_idx] = output[layer_idx]
 
-    last_protein_hiddens = []
-    for layer in layers:
-        last_protein_hidden = last_hidden_by_layer[layer][0, -last_protein_len:, :]
-        last_protein_hiddens.append(last_protein_hidden)
-
-    return protein_names, last_protein_hiddens, rank_ids
+    outputs = []
+    for bidx, sample in enumerate(sample_contexts):
+        seq_len = sample["input_len"]
+        last_protein_len = sample["last_protein_len"]
+        last_protein_hiddens = []
+        for layer_idx in layers:
+            hidden = last_hidden_by_layer[layer_idx]
+            last_hidden = hidden[bidx, seq_len - last_protein_len : seq_len, :]
+            last_protein_hiddens.append(last_hidden)
+        outputs.append(
+            (
+                sample["protein_names"],
+                last_protein_hiddens,
+                sample["rank_ids"],
+            )
+        )
+    return outputs
 
 
 def main():
     # Load model and tokenizer
     model, tokenizer = load_dayhoff_model_tokenizer()
+    pad_token_id = tokenizer(MSA_PAD)
 
     # Load taxonomy mapping
     taxid_to_rank = load_taxonomy_mapping(TAXONOMY_MAPPING_FILE, RANKS_TO_PROBE)
@@ -384,22 +441,24 @@ def main():
                 rank_to_indices[rank_id].append(idx)
             n_classes = len(set(c for c in rank_ids if c is not None))
             if n_classes < 2:
-                for _ in range(N_SAMPLES_PER_OG):
-                    protein_names, last_protein_hiddens, rank_ids_sampled = (
-                        get_last_protein_hidden_for_sample(
-                            model,
-                            row.protein,
-                            rank_ids,
-                            row.seq,
-                            tokenizer,
-                            src_rank_id=None,
-                            tgt_rank_id=None,
-                            rank_to_indices=rank_to_indices,
-                            layers=layers_for_rank,
-                        )
-                    )
-                    if protein_names is None:
-                        continue
+                sample_outputs = get_last_protein_hidden_for_samples_batched(
+                    model,
+                    row.protein,
+                    rank_ids,
+                    row.seq,
+                    tokenizer,
+                    n_samples=N_SAMPLES_PER_OG,
+                    pad_token_id=pad_token_id,
+                    src_rank_id=None,
+                    tgt_rank_id=None,
+                    rank_to_indices=rank_to_indices,
+                    layers=layers_for_rank,
+                )
+                for (
+                    protein_names,
+                    last_protein_hiddens,
+                    rank_ids_sampled,
+                ) in sample_outputs:
                     # run probe on last protein hidden
                     for layer_idx, last_protein_hidden in zip(
                         layers_for_rank, last_protein_hiddens
@@ -423,29 +482,30 @@ def main():
             else:
                 # for each pair of classes in this OG, sample proteins and run probe
                 unique_rank_ids = set(c for c in rank_ids if c is not None)
-                all_combinations = itertools.product(unique_rank_ids, repeat=2)
-
+                # show inner loop progress with another tqdm bar
                 for src_rank_id, tgt_rank_id in tqdm(
-                    all_combinations,
-                    total=len(unique_rank_ids) ** 2,
-                    desc=f"OG {row.og} rank {rank} sampling",
+                    itertools.product(unique_rank_ids, repeat=2),
+                    total=n_classes**2,
+                    desc="Sampling class pairs for evaluation",
                 ):
-                    for _ in range(N_SAMPLES_PER_OG):
-                        protein_names, last_protein_hiddens, rank_ids_sampled = (
-                            get_last_protein_hidden_for_sample(
-                                model,
-                                row.protein,
-                                rank_ids,
-                                row.seq,
-                                tokenizer,
-                                src_rank_id=src_rank_id,
-                                tgt_rank_id=tgt_rank_id,
-                                rank_to_indices=rank_to_indices,
-                                layers=layers_for_rank,
-                            )
-                        )
-                        if protein_names is None:
-                            break
+                    sample_outputs = get_last_protein_hidden_for_samples_batched(
+                        model,
+                        row.protein,
+                        rank_ids,
+                        row.seq,
+                        tokenizer,
+                        n_samples=N_SAMPLES_PER_OG,
+                        pad_token_id=pad_token_id,
+                        src_rank_id=src_rank_id,
+                        tgt_rank_id=tgt_rank_id,
+                        rank_to_indices=rank_to_indices,
+                        layers=layers_for_rank,
+                    )
+                    for (
+                        protein_names,
+                        last_protein_hiddens,
+                        rank_ids_sampled,
+                    ) in sample_outputs:
                         # run probe on last protein hidden
                         for layer_idx, last_protein_hidden in zip(
                             layers_for_rank, last_protein_hiddens
