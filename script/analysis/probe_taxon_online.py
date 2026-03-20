@@ -24,6 +24,7 @@ import time
 from collections import Counter
 from contextlib import nullcontext
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -56,6 +57,10 @@ TAXONOMY_RANKS = ["genus", "family", "order", "class", "phylum", "domain"]
 TOKENIZER_CONFIG = {"vocab_path": "vocab_UL_ALPHABET_PLUS.txt", "allow_unk": False}
 
 HIDDEN_DIM = 1280
+
+
+class _EarlyStopForward(Exception):
+    """Internal exception used to stop forward once target hidden is captured."""
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -102,8 +107,8 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of samples to take per OG during evaluation (should be higher).",
     )
-    p.add_argument("--epochs", type=int, default=20)
-    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--lr", type=float, default=1e-2)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--min_class_count", type=int, default=50)
     p.add_argument("--seed", type=int, default=42)
@@ -144,6 +149,18 @@ def parse_args() -> argparse.Namespace:
 
     # Eval & checkpointing
     p.add_argument("--eval_every", type=int, default=1)
+    p.add_argument(
+        "--eval_every_steps",
+        type=int,
+        default=0,
+        help="Run validation every N optimizer steps (0 disables step-level eval).",
+    )
+    p.add_argument(
+        "--max_train_steps",
+        type=int,
+        default=0,
+        help="Maximum optimizer steps across all epochs (0 disables step cap).",
+    )
     p.add_argument("--save_every_epoch", action="store_true")
     p.add_argument("--resume_from", type=str, default=None)
 
@@ -287,10 +304,81 @@ def load_parquet_files(glob_pattern: str) -> pd.DataFrame:
     return df
 
 
+def hidden_idx_to_hook_layer(layer_idx: int, n_model_layers: int) -> int:
+    """
+    Convert hidden_states index to decoder layer index for forward hooks.
+
+    Convention in this codebase:
+      hidden_states[0] = embedding
+      hidden_states[k] = output of decoder layer k-1 (k > 0)
+      hidden_states[-1] = output of last decoder layer
+    """
+    if layer_idx == -1:
+        return n_model_layers - 1
+    if layer_idx <= 0 or layer_idx > n_model_layers:
+        raise ValueError(
+            f"Unsupported hidden state index {layer_idx}; expected 1..{n_model_layers} or -1"
+        )
+    return layer_idx - 1
+
+
+@torch.inference_mode()
+def extract_hidden_at_layer_with_early_stop(
+    pretrained_model: nn.Module,
+    input_ids: torch.Tensor,
+    layer_idx: int,
+) -> torch.Tensor:
+    """
+    Capture hidden states from a target decoder layer and terminate forward early.
+
+    This avoids computing later layers and avoids LM head/logits computation.
+    """
+    backbone = pretrained_model.model if hasattr(pretrained_model, "model") else pretrained_model
+    if not hasattr(backbone, "layers"):
+        raise RuntimeError("Backbone has no 'layers' attribute for hook-based extraction")
+
+    n_model_layers = len(backbone.layers)
+    hook_layer = hidden_idx_to_hook_layer(layer_idx, n_model_layers)
+    captured: dict[str, torch.Tensor] = {}
+
+    def _capture_and_stop(_module, _inputs, output):
+        hidden = output[0] if isinstance(output, tuple) else output
+        captured["hidden"] = hidden
+        raise _EarlyStopForward()
+
+    handle = backbone.layers[hook_layer].register_forward_hook(_capture_and_stop)
+    try:
+        try:
+            try:
+                backbone(
+                    input_ids=input_ids,
+                    output_hidden_states=False,
+                    return_dict=True,
+                    use_cache=False,
+                )
+            except TypeError:
+                # Some backbones may not expose use_cache.
+                backbone(
+                    input_ids=input_ids,
+                    output_hidden_states=False,
+                    return_dict=True,
+                )
+        except _EarlyStopForward:
+            pass
+    finally:
+        handle.remove()
+
+    if "hidden" not in captured:
+        raise RuntimeError(
+            f"Hook failed to capture hidden states at layer_idx={layer_idx}"
+        )
+    return captured["hidden"]
+
+
 # ──────────────────────────────────────────────────────────────────────
 # On-the-fly hidden extraction
 # ──────────────────────────────────────────────────────────────────────
-@torch.no_grad()
+@torch.inference_mode()
 def extract_last_protein_hidden(
     pretrained_model: nn.Module,
     seqs: list[str],
@@ -328,20 +416,16 @@ def extract_last_protein_hidden(
         .to("cuda")
     )
 
-    output = pretrained_model(
+    hidden = extract_hidden_at_layer_with_early_stop(
+        pretrained_model=pretrained_model,
         input_ids=input_ids,
-        output_hidden_states=True,
-        return_dict=True,
-    )
+        layer_idx=layer_idx,
+    )[0, -last_protein_len:, :]
 
-    hidden_states = output.hidden_states
-    hidden = hidden_states[layer_idx][0, -last_protein_len:, :]  # (seq_len, hidden_dim)
-
-    del output, hidden_states
     return hidden, last_taxid
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def extract_last_protein_hidden_batch(
     pretrained_model: nn.Module,
     seqs: list[str],
@@ -396,13 +480,11 @@ def extract_last_protein_hidden_batch(
         batch_input_ids[i, : sampled_input_lens[i]] = input_ids
 
     batch_input_ids = batch_input_ids.to("cuda", non_blocking=True)
-    output = pretrained_model(
+    hidden = extract_hidden_at_layer_with_early_stop(
+        pretrained_model=pretrained_model,
         input_ids=batch_input_ids,
-        output_hidden_states=True,
-        return_dict=True,
+        layer_idx=layer_idx,
     )
-
-    hidden = output.hidden_states[layer_idx]
     max_last_len = max(sampled_last_lens)
     last_hidden = torch.zeros(
         (n_samples, max_last_len, hidden.shape[-1]),
@@ -420,7 +502,6 @@ def extract_last_protein_hidden_batch(
         last_hidden[i, :last_len] = hidden[i, start:input_len]
         last_mask[i, :last_len] = True
 
-    del output
     return last_hidden, last_mask, sampled_last_taxids
 
 
@@ -434,7 +515,9 @@ def hierarchical_taxonomic_loss(
     rank_weights: dict[str, float],
     species_weight: float,
     species_ce_weight: torch.Tensor | None,
-) -> torch.Tensor:
+    return_breakdown: bool = False,
+    return_unweighted_breakdown: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, dict[str, float], dict[str, float]]:
     """
     Compute hierarchical taxonomic loss for a single protein's positions.
 
@@ -453,9 +536,15 @@ def hierarchical_taxonomic_loss(
     species_labels = torch.full(
         (n_positions,), species_label, dtype=torch.long, device=device
     )
-    loss = species_weight * F.cross_entropy(
+    species_term_unweighted = F.cross_entropy(
         logits, species_labels, weight=species_ce_weight
     )
+    species_term = species_weight * species_term_unweighted
+    loss = species_term
+    breakdown_weighted: dict[str, float] = {"species": float(species_term.detach())}
+    breakdown_unweighted: dict[str, float] = {
+        "species": float(species_term_unweighted.detach())
+    }
 
     # Species probabilities for aggregation up the tree
     species_probs = F.softmax(logits, dim=-1)  # (n_positions, n_species)
@@ -476,8 +565,16 @@ def hierarchical_taxonomic_loss(
         group_labels = torch.full(
             (n_positions,), int(group_label), dtype=torch.long, device=device
         )
-        loss = loss + w * F.nll_loss(group_log_probs, group_labels)
+        rank_term_unweighted = F.nll_loss(group_log_probs, group_labels)
+        rank_term = w * rank_term_unweighted
+        loss = loss + rank_term
+        breakdown_weighted[rank_name] = float(rank_term.detach())
+        breakdown_unweighted[rank_name] = float(rank_term_unweighted.detach())
 
+    if return_breakdown:
+        if not return_unweighted_breakdown:
+            breakdown_unweighted = {}
+        return loss, breakdown_weighted, breakdown_unweighted
     return loss
 
 
@@ -497,6 +594,9 @@ def evaluate(
     n_max_protein: int,
     rand_generator: torch.Generator,
     n_species: int,
+    rank_weights: dict[str, float],
+    species_weight: float,
+    species_ce_weight: torch.Tensor | None,
 ) -> dict[str, float]:
     """
     Evaluate species + hierarchical accuracy on a split.
@@ -514,6 +614,8 @@ def evaluate(
 
     n_proteins_eval = 0
     n_skipped = 0
+    eval_loss_weighted = 0.0
+    eval_positions = 0
 
     for _, row in tqdm(df.iterrows(), total=len(df), desc="Evaluating"):
         seqs = row["seq"]
@@ -534,6 +636,22 @@ def evaluate(
                 n_skipped += 1
                 continue
             logits = probe(hidden.float())  # (seq_len, n_species)
+            sample_loss_out = hierarchical_taxonomic_loss(
+                logits=logits,
+                species_label=int(cls_idx),
+                agg_data=agg_data,
+                rank_weights=rank_weights,
+                species_weight=species_weight,
+                species_ce_weight=species_ce_weight,
+            )
+            sample_loss = (
+                sample_loss_out[0]
+                if isinstance(sample_loss_out, tuple)
+                else sample_loss_out
+            )
+            eval_loss_weighted += float(sample_loss.detach()) * int(logits.shape[0])
+            eval_positions += int(logits.shape[0])
+
             preds = logits.argmax(dim=1).cpu().numpy()
             species_conf[cls_idx] += np.bincount(preds, minlength=n_species)
 
@@ -559,6 +677,7 @@ def evaluate(
     results: dict[str, float] = {}
 
     # Species metrics
+    results["loss"] = eval_loss_weighted / max(eval_positions, 1)
     total = species_conf.sum()
     results["species_overall_acc"] = (
         float(species_conf.trace() / total) if total > 0 else 0.0
@@ -618,6 +737,73 @@ def save_checkpoint(
         },
         path,
     )
+
+
+def save_eval_probe_snapshot(
+    output_dir: Path,
+    probe: nn.Module,
+    epoch: int,
+    optimizer_step: int,
+    eval_tag: str,
+    eval_index: int,
+    metrics: dict[str, float],
+) -> Path:
+    """
+    Save a probe snapshot for every evaluation event.
+    """
+    snapshots_dir = output_dir / "eval_probe_snapshots"
+    snapshots_dir.mkdir(parents=True, exist_ok=True)
+    path = snapshots_dir / f"probe_eval_{eval_index:05d}_{eval_tag}.pt"
+    torch.save(
+        {
+            "eval_index": int(eval_index),
+            "eval_tag": str(eval_tag),
+            "epoch": int(epoch),
+            "optimizer_step": int(optimizer_step),
+            "model_state_dict": probe.state_dict(),
+            "metrics": metrics,
+        },
+        path,
+    )
+    return path
+
+
+def save_inference_artifacts(
+    output_dir: Path,
+    probe: nn.Module,
+    species_encoder: LabelEncoder,
+    tid_to_cls: dict[int, int],
+    agg_data: dict[str, tuple[torch.Tensor, torch.Tensor, LabelEncoder]],
+    rank_weights: dict[str, float],
+    species_weight: float,
+    args: argparse.Namespace,
+) -> Path:
+    """
+    Save all artifacts needed for offline species and per-rank prediction.
+    """
+    ranks_data: dict[str, dict[str, object]] = {}
+    infer_artifacts: dict[str, object] = {
+        "probe_state_dict": probe.state_dict(),
+        "species_classes": species_encoder.classes_.tolist(),
+        "tid_to_cls": {int(k): int(v) for k, v in tid_to_cls.items()},
+        "cls_to_tid": {int(v): int(k) for k, v in tid_to_cls.items()},
+        "ranks": ranks_data,
+        "rank_weights": {**rank_weights, "species": float(species_weight)},
+        "layer_idx": int(args.layer_idx),
+        "hidden_dim": int(HIDDEN_DIM),
+        "n_species": int(len(species_encoder.classes_)),
+    }
+
+    for rank_name, (M, species_to_group, group_enc) in agg_data.items():
+        ranks_data[rank_name] = {
+            "M": M.detach().cpu(),
+            "species_to_group": species_to_group.detach().cpu(),
+            "group_classes": group_enc.classes_.tolist(),
+        }
+
+    out_path = output_dir / "prediction_artifacts.pt"
+    torch.save(infer_artifacts, out_path)
+    return out_path
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -749,6 +935,9 @@ def run() -> None:
     best_state = {k: v.detach().cpu().clone() for k, v in probe.state_dict().items()}
 
     rand_generator = torch.Generator().manual_seed(args.seed)
+    optimizer_steps = 0
+    stop_training = False
+    eval_counter = 0
 
     # ── Training loop ────────────────────────────────────────────────
     for epoch in range(start_epoch, args.epochs):
@@ -762,6 +951,34 @@ def run() -> None:
         epoch_loss = 0.0
         epoch_positions = 0
         n_ogs = 0
+        epoch_rank_loss_weighted: dict[str, float] = {
+            "species": 0.0,
+            **{rank_name: 0.0 for rank_name in TAXONOMY_RANKS},
+        }
+        epoch_rank_loss_unweighted: dict[str, float] = {
+            "species": 0.0,
+            **{rank_name: 0.0 for rank_name in TAXONOMY_RANKS},
+        }
+        step_window_loss_weighted = 0.0
+        step_window_positions = 0
+        step_window_rank_loss_weighted: dict[str, float] = {
+            "species": 0.0,
+            **{rank_name: 0.0 for rank_name in TAXONOMY_RANKS},
+        }
+        step_window_rank_loss_unweighted: dict[str, float] = {
+            "species": 0.0,
+            **{rank_name: 0.0 for rank_name in TAXONOMY_RANKS},
+        }
+        last_opt_step_avg_loss = float("nan")
+        last_opt_step_rank_avg_weighted: dict[str, float] = {
+            "species": float("nan"),
+            **{rank_name: float("nan") for rank_name in TAXONOMY_RANKS},
+        }
+        last_opt_step_rank_avg_unweighted: dict[str, float] = {
+            "species": float("nan"),
+            **{rank_name: float("nan") for rank_name in TAXONOMY_RANKS},
+        }
+        grad_accum_counter = 0
         optimizer.zero_grad(set_to_none=True)
 
         pbar = tqdm(shuffled_indices, desc=f"Epoch {epoch + 1}/{args.epochs}")
@@ -807,16 +1024,55 @@ def run() -> None:
                     for sample_len, cls_idx in zip(sample_lens, valid_cls_indices):
                         logits = flat_logits[offset : offset + sample_len]
                         offset += sample_len
-                        sample_loss = hierarchical_taxonomic_loss(
+                        sample_loss_out = hierarchical_taxonomic_loss(
                             logits=logits,
                             species_label=cls_idx,
                             agg_data=agg_data,
                             rank_weights=rank_weights,
                             species_weight=species_loss_weight,
                             species_ce_weight=species_ce_weight,
+                            return_breakdown=True,
+                            return_unweighted_breakdown=True,
                         )
+                        if not isinstance(sample_loss_out, tuple) or len(sample_loss_out) != 3:
+                            raise RuntimeError(
+                                "Expected hierarchical_taxonomic_loss to return "
+                                "(loss, weighted_breakdown, unweighted_breakdown)"
+                            )
+                        sample_loss_tuple = cast(
+                            tuple[torch.Tensor, dict[str, float], dict[str, float]],
+                            sample_loss_out,
+                        )
+                        (
+                            sample_loss,
+                            sample_breakdown_weighted,
+                            sample_breakdown_unweighted,
+                        ) = sample_loss_tuple
                         total_loss = total_loss + sample_loss
                         total_weighted_loss += float(sample_loss.detach()) * sample_len
+                        for loss_name, loss_val in sample_breakdown_weighted.items():
+                            if loss_name not in epoch_rank_loss_weighted:
+                                epoch_rank_loss_weighted[loss_name] = 0.0
+                            epoch_rank_loss_weighted[loss_name] += loss_val * sample_len
+                            if loss_name not in step_window_rank_loss_weighted:
+                                step_window_rank_loss_weighted[loss_name] = 0.0
+                            step_window_rank_loss_weighted[loss_name] += (
+                                loss_val * sample_len
+                            )
+                        for (
+                            loss_name,
+                            loss_val,
+                        ) in sample_breakdown_unweighted.items():
+                            if loss_name not in epoch_rank_loss_unweighted:
+                                epoch_rank_loss_unweighted[loss_name] = 0.0
+                            epoch_rank_loss_unweighted[loss_name] += (
+                                loss_val * sample_len
+                            )
+                            if loss_name not in step_window_rank_loss_unweighted:
+                                step_window_rank_loss_unweighted[loss_name] = 0.0
+                            step_window_rank_loss_unweighted[loss_name] += (
+                                loss_val * sample_len
+                            )
                         n_pos += sample_len
                     loss = total_loss / args.accumulation_steps
 
@@ -824,24 +1080,170 @@ def run() -> None:
                     scaler.scale(loss).backward()
                 else:
                     loss.backward()
+                grad_accum_counter += 1
 
                 epoch_loss += total_weighted_loss
                 epoch_positions += n_pos
                 n_ogs += 1
+                step_window_loss_weighted += total_weighted_loss
+                step_window_positions += n_pos
 
                 # Optimizer step every accumulation_steps
-                if (step_i + 1) % args.accumulation_steps == 0:
+                if grad_accum_counter % args.accumulation_steps == 0:
+                    # Snapshot current optimizer-step average loss (over accumulation window)
+                    last_opt_step_avg_loss = step_window_loss_weighted / max(step_window_positions, 1)
+                    for loss_name, loss_val in step_window_rank_loss_weighted.items():
+                        last_opt_step_rank_avg_weighted[loss_name] = loss_val / max(
+                            step_window_positions, 1
+                        )
+                    for loss_name, loss_val in step_window_rank_loss_unweighted.items():
+                        last_opt_step_rank_avg_unweighted[loss_name] = loss_val / max(
+                            step_window_positions, 1
+                        )
+
                     if amp_enabled:
                         scaler.step(optimizer)
                         scaler.update()
                     else:
                         optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
+                    optimizer_steps += 1
+
+                    # Reset step window after each optimizer step
+                    step_window_loss_weighted = 0.0
+                    step_window_positions = 0
+                    step_window_rank_loss_weighted = {
+                        "species": 0.0,
+                        **{rank_name: 0.0 for rank_name in TAXONOMY_RANKS},
+                    }
+                    step_window_rank_loss_unweighted = {
+                        "species": 0.0,
+                        **{rank_name: 0.0 for rank_name in TAXONOMY_RANKS},
+                    }
+
+                    if args.eval_every_steps > 0 and (optimizer_steps % args.eval_every_steps == 0):
+                        val_metrics = evaluate(
+                            df=val_df,
+                            pretrained_model=pretrained_model,
+                            probe=probe,
+                            tokenizer=tokenizer,
+                            tid_to_cls=tid_to_cls,
+                            taxid_to_std_ranks=taxid_to_std_ranks,
+                            agg_data=agg_data,
+                            layer_idx=args.layer_idx,
+                            n_max_protein=args.n_max_protein,
+                            rand_generator=torch.Generator().manual_seed(args.seed),
+                            n_species=n_species,
+                            rank_weights=rank_weights,
+                            species_weight=species_loss_weight,
+                            species_ce_weight=species_ce_weight,
+                        )
+                        val_bacc = val_metrics["species_balanced_acc"]
+                        improved = val_bacc > best_val_bacc
+                        if improved:
+                            best_val_bacc = val_bacc
+                            best_state = {
+                                k: v.detach().cpu().clone() for k, v in probe.state_dict().items()
+                            }
+                            save_checkpoint(
+                                checkpoint_best,
+                                epoch,
+                                probe,
+                                optimizer,
+                                scheduler,
+                                best_val_bacc,
+                                history,
+                                args,
+                            )
+
+                        if scheduler is not None:
+                            scheduler.step(float(val_metrics["loss"]))
+
+                        history.append(
+                            {
+                                "epoch": epoch,
+                                "optimizer_step": optimizer_steps,
+                                "lr": float(optimizer.param_groups[0]["lr"]),
+                                **{f"val_{k}": v for k, v in val_metrics.items()},
+                                "best_val_species_balanced_acc": best_val_bacc,
+                            }
+                        )
+                        print(
+                            f"StepEval step={optimizer_steps:,} | "
+                            f"val_loss={val_metrics['loss']:.4f} | "
+                            f"sp_bacc={val_metrics['species_balanced_acc']:.4f} | "
+                            f"sp_acc={val_metrics['species_overall_acc']:.4f}"
+                        )
+                        eval_counter += 1
+                        save_eval_probe_snapshot(
+                            output_dir=output_dir,
+                            probe=probe,
+                            epoch=epoch,
+                            optimizer_step=optimizer_steps,
+                            eval_tag="step_val",
+                            eval_index=eval_counter,
+                            metrics=val_metrics,
+                        )
+                        probe.train()
+
+                    if args.max_train_steps > 0 and optimizer_steps >= args.max_train_steps:
+                        stop_training = True
+                        print(f"Reached max_train_steps={args.max_train_steps}; stopping training.")
+                        break
 
                 if n_ogs % 100 == 0:
-                    avg_loss = epoch_loss / max(epoch_positions, 1)
                     pbar.set_postfix(
-                        loss=f"{avg_loss:.4f}", pos=f"{epoch_positions:,}", ogs=n_ogs
+                        loss=(
+                            f"{last_opt_step_avg_loss:.4f}"
+                            if np.isfinite(last_opt_step_avg_loss)
+                            else "n/a"
+                        ),
+                        pos=f"{epoch_positions:,}",
+                        ogs=n_ogs,
+                        opt_steps=optimizer_steps,
+                    )
+                    rank_msg = []
+                    if np.isfinite(
+                        last_opt_step_rank_avg_weighted.get("species", float("nan"))
+                    ):
+                        rank_msg.append(
+                            f"species={last_opt_step_rank_avg_weighted['species']:.4f}"
+                        )
+                    else:
+                        rank_msg.append("species=n/a")
+                    for rank_name in TAXONOMY_RANKS:
+                        rank_v = last_opt_step_rank_avg_weighted.get(
+                            rank_name, float("nan")
+                        )
+                        rank_msg.append(
+                            f"{rank_name}={rank_v:.4f}" if np.isfinite(rank_v) else f"{rank_name}=n/a"
+                        )
+
+                    rank_msg_unweighted = []
+                    if np.isfinite(
+                        last_opt_step_rank_avg_unweighted.get("species", float("nan"))
+                    ):
+                        rank_msg_unweighted.append(
+                            f"species={last_opt_step_rank_avg_unweighted['species']:.4f}"
+                        )
+                    else:
+                        rank_msg_unweighted.append("species=n/a")
+                    for rank_name in TAXONOMY_RANKS:
+                        rank_v = last_opt_step_rank_avg_unweighted.get(
+                            rank_name, float("nan")
+                        )
+                        rank_msg_unweighted.append(
+                            f"{rank_name}={rank_v:.4f}" if np.isfinite(rank_v) else f"{rank_name}=n/a"
+                        )
+                    print(
+                        f"TrainLossBreakdown(opt_step_avg,weighted) ogs={n_ogs:,} "
+                        f"pos={epoch_positions:,} | "
+                        + " | ".join(rank_msg)
+                    )
+                    print(
+                        f"TrainLossBreakdown(opt_step_avg,unweighted) ogs={n_ogs:,} "
+                        f"pos={epoch_positions:,} | "
+                        + " | ".join(rank_msg_unweighted)
                     )
 
             except Exception as e:
@@ -851,23 +1253,121 @@ def run() -> None:
                 continue
 
         # Flush remaining gradients
-        if n_ogs % args.accumulation_steps != 0:
+        if (not stop_training) and (grad_accum_counter % args.accumulation_steps != 0):
+            # Snapshot current optimizer-step average loss for flush step
+            last_opt_step_avg_loss = step_window_loss_weighted / max(step_window_positions, 1)
+            for loss_name, loss_val in step_window_rank_loss_weighted.items():
+                last_opt_step_rank_avg_weighted[loss_name] = loss_val / max(
+                    step_window_positions, 1
+                )
+            for loss_name, loss_val in step_window_rank_loss_unweighted.items():
+                last_opt_step_rank_avg_unweighted[loss_name] = loss_val / max(
+                    step_window_positions, 1
+                )
+
             if amp_enabled:
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            optimizer_steps += 1
+
+            # Reset step window after flush step
+            step_window_loss_weighted = 0.0
+            step_window_positions = 0
+            step_window_rank_loss_weighted = {
+                "species": 0.0,
+                **{rank_name: 0.0 for rank_name in TAXONOMY_RANKS},
+            }
+            step_window_rank_loss_unweighted = {
+                "species": 0.0,
+                **{rank_name: 0.0 for rank_name in TAXONOMY_RANKS},
+            }
+
+            if args.eval_every_steps > 0 and (optimizer_steps % args.eval_every_steps == 0):
+                val_metrics = evaluate(
+                    df=val_df,
+                    pretrained_model=pretrained_model,
+                    probe=probe,
+                    tokenizer=tokenizer,
+                    tid_to_cls=tid_to_cls,
+                    taxid_to_std_ranks=taxid_to_std_ranks,
+                    agg_data=agg_data,
+                    layer_idx=args.layer_idx,
+                    n_max_protein=args.n_max_protein,
+                    rand_generator=torch.Generator().manual_seed(args.seed),
+                    n_species=n_species,
+                    rank_weights=rank_weights,
+                    species_weight=species_loss_weight,
+                    species_ce_weight=species_ce_weight,
+                )
+                val_bacc = val_metrics["species_balanced_acc"]
+                improved = val_bacc > best_val_bacc
+                if improved:
+                    best_val_bacc = val_bacc
+                    best_state = {
+                        k: v.detach().cpu().clone() for k, v in probe.state_dict().items()
+                    }
+                    save_checkpoint(
+                        checkpoint_best,
+                        epoch,
+                        probe,
+                        optimizer,
+                        scheduler,
+                        best_val_bacc,
+                        history,
+                        args,
+                    )
+
+                if scheduler is not None:
+                    scheduler.step(float(val_metrics["loss"]))
+
+                history.append(
+                    {
+                        "epoch": epoch,
+                        "optimizer_step": optimizer_steps,
+                        "lr": float(optimizer.param_groups[0]["lr"]),
+                        **{f"val_{k}": v for k, v in val_metrics.items()},
+                        "best_val_species_balanced_acc": best_val_bacc,
+                    }
+                )
+                print(
+                    f"StepEval step={optimizer_steps:,} | "
+                    f"val_loss={val_metrics['loss']:.4f} | "
+                    f"sp_bacc={val_metrics['species_balanced_acc']:.4f} | "
+                    f"sp_acc={val_metrics['species_overall_acc']:.4f}"
+                )
+                eval_counter += 1
+                save_eval_probe_snapshot(
+                    output_dir=output_dir,
+                    probe=probe,
+                    epoch=epoch,
+                    optimizer_step=optimizer_steps,
+                    eval_tag="step_flush_val",
+                    eval_index=eval_counter,
+                    metrics=val_metrics,
+                )
+                probe.train()
 
         train_loss = epoch_loss / max(epoch_positions, 1)
-        if scheduler is not None:
+        epoch_rank_avg_weighted = {
+            k: (v / max(epoch_positions, 1)) for k, v in epoch_rank_loss_weighted.items()
+        }
+        epoch_rank_avg_unweighted = {
+            k: (v / max(epoch_positions, 1)) for k, v in epoch_rank_loss_unweighted.items()
+        }
+        if scheduler is not None and args.eval_every_steps <= 0:
             scheduler.step(train_loss)
 
         current_lr = float(optimizer.param_groups[0]["lr"])
         epoch_time = time.time() - t0
 
         # ── Evaluation ───────────────────────────────────────────────
-        should_eval = ((epoch + 1) % args.eval_every == 0) or (epoch == args.epochs - 1)
+        should_eval = (
+            args.eval_every_steps <= 0
+            and (((epoch + 1) % args.eval_every == 0) or (epoch == args.epochs - 1))
+        )
         val_metrics: dict[str, float] | None = None
         improved = False
 
@@ -884,6 +1384,9 @@ def run() -> None:
                 n_max_protein=args.n_max_protein,
                 rand_generator=torch.Generator().manual_seed(args.seed),
                 n_species=n_species,
+                rank_weights=rank_weights,
+                species_weight=species_loss_weight,
+                species_ce_weight=species_ce_weight,
             )
             val_bacc = val_metrics["species_balanced_acc"]
             improved = val_bacc > best_val_bacc
@@ -892,14 +1395,31 @@ def run() -> None:
                 best_state = {
                     k: v.detach().cpu().clone() for k, v in probe.state_dict().items()
                 }
+            eval_counter += 1
+            save_eval_probe_snapshot(
+                output_dir=output_dir,
+                probe=probe,
+                epoch=epoch,
+                optimizer_step=optimizer_steps,
+                eval_tag="epoch_val",
+                eval_index=eval_counter,
+                metrics=val_metrics,
+            )
 
         epoch_metrics = {
             "epoch": epoch,
             "train_loss": train_loss,
+            "train_opt_step_loss": (
+                float(last_opt_step_avg_loss)
+                if np.isfinite(last_opt_step_avg_loss)
+                else None
+            ),
             "train_positions": epoch_positions,
             "train_ogs": n_ogs,
             "lr": current_lr,
             "epoch_time_sec": epoch_time,
+            "train_rank_loss_weighted": epoch_rank_avg_weighted,
+            "train_rank_loss_unweighted": epoch_rank_avg_unweighted,
         }
         if val_metrics is not None:
             epoch_metrics.update({f"val_{k}": v for k, v in val_metrics.items()})
@@ -908,8 +1428,10 @@ def run() -> None:
 
         # Print summary
         summary = (
-            f"Epoch {epoch + 1}/{args.epochs} | loss={train_loss:.4f} | "
-            f"lr={current_lr:.3e} | ogs={n_ogs:,} | pos={epoch_positions:,} | "
+            f"Epoch {epoch + 1}/{args.epochs} | opt_step_loss="
+            f"{last_opt_step_avg_loss:.4f} | epoch_loss={train_loss:.4f} | "
+            f"lr={current_lr:.3e} | opt_steps={optimizer_steps:,} | "
+            f"ogs={n_ogs:,} | pos={epoch_positions:,} | "
             f"time={epoch_time:.1f}s"
         )
         if val_metrics is not None:
@@ -922,6 +1444,31 @@ def run() -> None:
                 if key in val_metrics:
                     summary += f" | {rank_name[:3]}_bacc={val_metrics[key]:.4f}"
         print(summary)
+        weighted_parts = []
+        weighted_parts.append(
+            f"species={epoch_rank_avg_weighted.get('species', float('nan')):.4f}"
+        )
+        for rank_name in TAXONOMY_RANKS:
+            rank_v = epoch_rank_avg_weighted.get(rank_name, float("nan"))
+            weighted_parts.append(
+                f"{rank_name}={rank_v:.4f}" if np.isfinite(rank_v) else f"{rank_name}=n/a"
+            )
+        print(
+            "EpochLossBreakdown(weighted) | " + " | ".join(weighted_parts)
+        )
+
+        unweighted_parts = []
+        unweighted_parts.append(
+            f"species={epoch_rank_avg_unweighted.get('species', float('nan')):.4f}"
+        )
+        for rank_name in TAXONOMY_RANKS:
+            rank_v = epoch_rank_avg_unweighted.get(rank_name, float("nan"))
+            unweighted_parts.append(
+                f"{rank_name}={rank_v:.4f}" if np.isfinite(rank_v) else f"{rank_name}=n/a"
+            )
+        print(
+            "EpochLossBreakdown(unweighted) | " + " | ".join(unweighted_parts)
+        )
 
         # Checkpointing
         save_checkpoint(
@@ -957,6 +1504,9 @@ def run() -> None:
                 args,
             )
 
+        if stop_training:
+            break
+
     # ── Final evaluation with best weights ───────────────────────────
     probe.load_state_dict(best_state)
 
@@ -974,7 +1524,21 @@ def run() -> None:
         n_max_protein=args.n_max_protein,
         rand_generator=final_rand_gen,
         n_species=n_species,
+        rank_weights=rank_weights,
+        species_weight=species_loss_weight,
+        species_ce_weight=species_ce_weight,
     )
+    eval_counter += 1
+    save_eval_probe_snapshot(
+        output_dir=output_dir,
+        probe=probe,
+        epoch=max(start_epoch, args.epochs) - 1,
+        optimizer_step=optimizer_steps,
+        eval_tag="final_val",
+        eval_index=eval_counter,
+        metrics=val_metrics,
+    )
+
     test_metrics = evaluate(
         df=test_df,
         pretrained_model=pretrained_model,
@@ -987,6 +1551,19 @@ def run() -> None:
         n_max_protein=args.n_max_protein,
         rand_generator=torch.Generator().manual_seed(args.seed),
         n_species=n_species,
+        rank_weights=rank_weights,
+        species_weight=species_loss_weight,
+        species_ce_weight=species_ce_weight,
+    )
+    eval_counter += 1
+    save_eval_probe_snapshot(
+        output_dir=output_dir,
+        probe=probe,
+        epoch=max(start_epoch, args.epochs) - 1,
+        optimizer_step=optimizer_steps,
+        eval_tag="final_test",
+        eval_index=eval_counter,
+        metrics=test_metrics,
     )
 
     print("\n=== Final Results (best checkpoint) ===")
@@ -1021,6 +1598,18 @@ def run() -> None:
     }
     with open(output_dir / "encoders.pkl", "wb") as f:
         pickle.dump(encoder_data, f)
+
+    infer_path = save_inference_artifacts(
+        output_dir=output_dir,
+        probe=probe,
+        species_encoder=species_encoder,
+        tid_to_cls=tid_to_cls,
+        agg_data=agg_data,
+        rank_weights=rank_weights,
+        species_weight=species_loss_weight,
+        args=args,
+    )
+    print(f"Inference artifacts saved to {infer_path}")
 
     print(f"\nArtifacts saved to {output_dir}")
 
