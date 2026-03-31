@@ -352,6 +352,7 @@ def main():
                     "og": row[col_idx["og"]],
                     "n_proteins": len(row[col_idx["seq"]]),
                     "mean_seq_len": np.mean([len(s) for s in row[col_idx["seq"]]]),
+                    "cluster_id": row[col_idx["cluster_id"]],
                 }
                 for rank in RANKS:
                     vals = row[col_idx[rank]]
