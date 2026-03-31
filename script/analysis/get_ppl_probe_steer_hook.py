@@ -30,7 +30,7 @@ from pathlib import Path
 # ═══════════════════════════════════════════════
 
 TEST_FPATH = "/scratch/suyuelyu/deimm/data/oma/oma_probe_meta_grouped_test.parquet"
-RANKS_TO_PROBE = "class"
+RANKS_TO_PROBE = "phylum"
 PROBE_PATH = Path("/scratch/suyuelyu/deimm/results/probe_taxon/")
 
 # Layer → probe file mapping
@@ -61,8 +61,8 @@ def hidden_idx_to_hook_layer(layer_idx: int) -> int:
 
 
 SEED = 3525
-STEER_GRAD_ALPHA = [1.0, 5.0, 10.0]  # scaling factors for steering vector
-N_TEST_PROTEINS = 50  # small subset for quick testing
+STEER_GRAD_ALPHA = [5.0, 10.0, 20.0]  # scaling factors for steering vector
+N_TEST_PROTEINS = None  # small subset for quick testing
 
 seed_everything(SEED)
 rand_generator = torch.Generator().manual_seed(SEED)
