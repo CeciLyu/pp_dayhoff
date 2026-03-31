@@ -260,6 +260,9 @@ def build_aggregation_matrices(
             if rank in rank_dict:
                 group_taxids.add(int(rank_dict[rank]))
 
+        # remove nan in group_taxids
+        group_taxids = {g for g in group_taxids if pd.notna(g)}
+
         if len(group_taxids) < 2:
             print(f"  Skipping rank '{rank}': only {len(group_taxids)} groups")
             continue
@@ -333,9 +336,15 @@ def extract_hidden_at_layer_with_early_stop(
 
     This avoids computing later layers and avoids LM head/logits computation.
     """
-    backbone = pretrained_model.model if hasattr(pretrained_model, "model") else pretrained_model
+    backbone = (
+        pretrained_model.model
+        if hasattr(pretrained_model, "model")
+        else pretrained_model
+    )
     if not hasattr(backbone, "layers"):
-        raise RuntimeError("Backbone has no 'layers' attribute for hook-based extraction")
+        raise RuntimeError(
+            "Backbone has no 'layers' attribute for hook-based extraction"
+        )
 
     n_model_layers = len(backbone.layers)
     hook_layer = hidden_idx_to_hook_layer(layer_idx, n_model_layers)
@@ -497,7 +506,9 @@ def extract_last_protein_hidden_batch(
         device=hidden.device,
     )
 
-    for i, (input_len, last_len) in enumerate(zip(sampled_input_lens, sampled_last_lens)):
+    for i, (input_len, last_len) in enumerate(
+        zip(sampled_input_lens, sampled_last_lens)
+    ):
         start = input_len - last_len
         last_hidden[i, :last_len] = hidden[i, start:input_len]
         last_mask[i, :last_len] = True
@@ -988,19 +999,23 @@ def run() -> None:
             taxids = row["taxid"]
 
             try:
-                hidden_batch, hidden_mask, last_tids = extract_last_protein_hidden_batch(
-                    pretrained_model,
-                    seqs,
-                    taxids,
-                    tokenizer,
-                    args.layer_idx,
-                    args.n_max_protein,
-                    rand_generator,
-                    max(1, args.n_sample_per_og_train),
-                    pad_token_id,
+                hidden_batch, hidden_mask, last_tids = (
+                    extract_last_protein_hidden_batch(
+                        pretrained_model,
+                        seqs,
+                        taxids,
+                        tokenizer,
+                        args.layer_idx,
+                        args.n_max_protein,
+                        rand_generator,
+                        max(1, args.n_sample_per_og_train),
+                        pad_token_id,
+                    )
                 )
                 cls_indices = [tid_to_cls.get(tid) for tid in last_tids]
-                valid_sample_ids = [i for i, cls_idx in enumerate(cls_indices) if cls_idx is not None]
+                valid_sample_ids = [
+                    i for i, cls_idx in enumerate(cls_indices) if cls_idx is not None
+                ]
                 if not valid_sample_ids:
                     continue
                 hidden_batch = hidden_batch[valid_sample_ids]
@@ -1013,7 +1028,9 @@ def run() -> None:
                     else nullcontext()
                 )
                 with autocast_ctx:
-                    flat_hidden = hidden_batch[hidden_mask]  # (sum_last_lens, hidden_dim)
+                    flat_hidden = hidden_batch[
+                        hidden_mask
+                    ]  # (sum_last_lens, hidden_dim)
                     flat_logits = probe(flat_hidden.float())
 
                     sample_lens = hidden_mask.sum(dim=1).tolist()
@@ -1034,7 +1051,10 @@ def run() -> None:
                             return_breakdown=True,
                             return_unweighted_breakdown=True,
                         )
-                        if not isinstance(sample_loss_out, tuple) or len(sample_loss_out) != 3:
+                        if (
+                            not isinstance(sample_loss_out, tuple)
+                            or len(sample_loss_out) != 3
+                        ):
                             raise RuntimeError(
                                 "Expected hierarchical_taxonomic_loss to return "
                                 "(loss, weighted_breakdown, unweighted_breakdown)"
@@ -1091,7 +1111,9 @@ def run() -> None:
                 # Optimizer step every accumulation_steps
                 if grad_accum_counter % args.accumulation_steps == 0:
                     # Snapshot current optimizer-step average loss (over accumulation window)
-                    last_opt_step_avg_loss = step_window_loss_weighted / max(step_window_positions, 1)
+                    last_opt_step_avg_loss = step_window_loss_weighted / max(
+                        step_window_positions, 1
+                    )
                     for loss_name, loss_val in step_window_rank_loss_weighted.items():
                         last_opt_step_rank_avg_weighted[loss_name] = loss_val / max(
                             step_window_positions, 1
@@ -1121,7 +1143,9 @@ def run() -> None:
                         **{rank_name: 0.0 for rank_name in TAXONOMY_RANKS},
                     }
 
-                    if args.eval_every_steps > 0 and (optimizer_steps % args.eval_every_steps == 0):
+                    if args.eval_every_steps > 0 and (
+                        optimizer_steps % args.eval_every_steps == 0
+                    ):
                         val_metrics = evaluate(
                             df=val_df,
                             pretrained_model=pretrained_model,
@@ -1143,7 +1167,8 @@ def run() -> None:
                         if improved:
                             best_val_bacc = val_bacc
                             best_state = {
-                                k: v.detach().cpu().clone() for k, v in probe.state_dict().items()
+                                k: v.detach().cpu().clone()
+                                for k, v in probe.state_dict().items()
                             }
                             save_checkpoint(
                                 checkpoint_best,
@@ -1186,9 +1211,14 @@ def run() -> None:
                         )
                         probe.train()
 
-                    if args.max_train_steps > 0 and optimizer_steps >= args.max_train_steps:
+                    if (
+                        args.max_train_steps > 0
+                        and optimizer_steps >= args.max_train_steps
+                    ):
                         stop_training = True
-                        print(f"Reached max_train_steps={args.max_train_steps}; stopping training.")
+                        print(
+                            f"Reached max_train_steps={args.max_train_steps}; stopping training."
+                        )
                         break
 
                 if n_ogs % 100 == 0:
@@ -1216,7 +1246,9 @@ def run() -> None:
                             rank_name, float("nan")
                         )
                         rank_msg.append(
-                            f"{rank_name}={rank_v:.4f}" if np.isfinite(rank_v) else f"{rank_name}=n/a"
+                            f"{rank_name}={rank_v:.4f}"
+                            if np.isfinite(rank_v)
+                            else f"{rank_name}=n/a"
                         )
 
                     rank_msg_unweighted = []
@@ -1233,17 +1265,17 @@ def run() -> None:
                             rank_name, float("nan")
                         )
                         rank_msg_unweighted.append(
-                            f"{rank_name}={rank_v:.4f}" if np.isfinite(rank_v) else f"{rank_name}=n/a"
+                            f"{rank_name}={rank_v:.4f}"
+                            if np.isfinite(rank_v)
+                            else f"{rank_name}=n/a"
                         )
                     print(
                         f"TrainLossBreakdown(opt_step_avg,weighted) ogs={n_ogs:,} "
-                        f"pos={epoch_positions:,} | "
-                        + " | ".join(rank_msg)
+                        f"pos={epoch_positions:,} | " + " | ".join(rank_msg)
                     )
                     print(
                         f"TrainLossBreakdown(opt_step_avg,unweighted) ogs={n_ogs:,} "
-                        f"pos={epoch_positions:,} | "
-                        + " | ".join(rank_msg_unweighted)
+                        f"pos={epoch_positions:,} | " + " | ".join(rank_msg_unweighted)
                     )
 
             except Exception as e:
@@ -1255,7 +1287,9 @@ def run() -> None:
         # Flush remaining gradients
         if (not stop_training) and (grad_accum_counter % args.accumulation_steps != 0):
             # Snapshot current optimizer-step average loss for flush step
-            last_opt_step_avg_loss = step_window_loss_weighted / max(step_window_positions, 1)
+            last_opt_step_avg_loss = step_window_loss_weighted / max(
+                step_window_positions, 1
+            )
             for loss_name, loss_val in step_window_rank_loss_weighted.items():
                 last_opt_step_rank_avg_weighted[loss_name] = loss_val / max(
                     step_window_positions, 1
@@ -1285,7 +1319,9 @@ def run() -> None:
                 **{rank_name: 0.0 for rank_name in TAXONOMY_RANKS},
             }
 
-            if args.eval_every_steps > 0 and (optimizer_steps % args.eval_every_steps == 0):
+            if args.eval_every_steps > 0 and (
+                optimizer_steps % args.eval_every_steps == 0
+            ):
                 val_metrics = evaluate(
                     df=val_df,
                     pretrained_model=pretrained_model,
@@ -1307,7 +1343,8 @@ def run() -> None:
                 if improved:
                     best_val_bacc = val_bacc
                     best_state = {
-                        k: v.detach().cpu().clone() for k, v in probe.state_dict().items()
+                        k: v.detach().cpu().clone()
+                        for k, v in probe.state_dict().items()
                     }
                     save_checkpoint(
                         checkpoint_best,
@@ -1352,10 +1389,12 @@ def run() -> None:
 
         train_loss = epoch_loss / max(epoch_positions, 1)
         epoch_rank_avg_weighted = {
-            k: (v / max(epoch_positions, 1)) for k, v in epoch_rank_loss_weighted.items()
+            k: (v / max(epoch_positions, 1))
+            for k, v in epoch_rank_loss_weighted.items()
         }
         epoch_rank_avg_unweighted = {
-            k: (v / max(epoch_positions, 1)) for k, v in epoch_rank_loss_unweighted.items()
+            k: (v / max(epoch_positions, 1))
+            for k, v in epoch_rank_loss_unweighted.items()
         }
         if scheduler is not None and args.eval_every_steps <= 0:
             scheduler.step(train_loss)
@@ -1364,9 +1403,8 @@ def run() -> None:
         epoch_time = time.time() - t0
 
         # ── Evaluation ───────────────────────────────────────────────
-        should_eval = (
-            args.eval_every_steps <= 0
-            and (((epoch + 1) % args.eval_every == 0) or (epoch == args.epochs - 1))
+        should_eval = args.eval_every_steps <= 0 and (
+            ((epoch + 1) % args.eval_every == 0) or (epoch == args.epochs - 1)
         )
         val_metrics: dict[str, float] | None = None
         improved = False
@@ -1451,11 +1489,11 @@ def run() -> None:
         for rank_name in TAXONOMY_RANKS:
             rank_v = epoch_rank_avg_weighted.get(rank_name, float("nan"))
             weighted_parts.append(
-                f"{rank_name}={rank_v:.4f}" if np.isfinite(rank_v) else f"{rank_name}=n/a"
+                f"{rank_name}={rank_v:.4f}"
+                if np.isfinite(rank_v)
+                else f"{rank_name}=n/a"
             )
-        print(
-            "EpochLossBreakdown(weighted) | " + " | ".join(weighted_parts)
-        )
+        print("EpochLossBreakdown(weighted) | " + " | ".join(weighted_parts))
 
         unweighted_parts = []
         unweighted_parts.append(
@@ -1464,11 +1502,11 @@ def run() -> None:
         for rank_name in TAXONOMY_RANKS:
             rank_v = epoch_rank_avg_unweighted.get(rank_name, float("nan"))
             unweighted_parts.append(
-                f"{rank_name}={rank_v:.4f}" if np.isfinite(rank_v) else f"{rank_name}=n/a"
+                f"{rank_name}={rank_v:.4f}"
+                if np.isfinite(rank_v)
+                else f"{rank_name}=n/a"
             )
-        print(
-            "EpochLossBreakdown(unweighted) | " + " | ".join(unweighted_parts)
-        )
+        print("EpochLossBreakdown(unweighted) | " + " | ".join(unweighted_parts))
 
         # Checkpointing
         save_checkpoint(
