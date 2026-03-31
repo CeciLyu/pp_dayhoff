@@ -36,11 +36,11 @@ TEST_FPATH = "/scratch/suyuelyu/deimm/data/oma/oma_probe_meta_grouped_test.parqu
 # RANKS_TO_PROBE = ["domain", "phylum", "class", "order", "family", "genus"]
 RANKS_TO_PROBE = [
     "phylum",
-    "domain",
-    "class",
-    "order",
-    "family",
-    "genus",
+    # "domain",
+    # "class",
+    # "order",
+    # "family",
+    # "genus",
 ]  # start with one rank for speed; expand after initial test
 PROBE_PATH = Path("/scratch/suyuelyu/deimm/results/probe_taxon/")
 
@@ -216,7 +216,9 @@ def compute_sampling_budget(n_classes: int) -> tuple[int, int, bool]:
     # "Max setting reached" means one of the caps actively constrained work.
     total_cap_hit = False
     if MAX_TOTAL_SAMPLES_PER_OG is not None:
-        total_cap_hit = condition_pairs_used * samples_per_condition >= MAX_TOTAL_SAMPLES_PER_OG
+        total_cap_hit = (
+            condition_pairs_used * samples_per_condition >= MAX_TOTAL_SAMPLES_PER_OG
+        )
     hit_max_setting = pair_cap_hit or total_cap_hit
     return condition_pairs_used, samples_per_condition, hit_max_setting
 
@@ -598,7 +600,11 @@ def main():
         if len(ogs_evaluated) == len(meta_grouped_test):
             print(f"All OGs already evaluated for rank {rank}, skipping...")
             continue
-
+        else:
+            print(
+                f"Already have results for {len(ogs_evaluated)} OGs for rank {rank},"
+                f"will evaluate remaining {len(meta_grouped_test) - len(ogs_evaluated)} OGs"
+            )
         print(f"Evaluating rank {rank}...")
         print(f"saving results to {output_path}...")
         n_new_og_results = 0
@@ -689,3 +695,21 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# Loaded test data with 986 orthologous groups
+# === Dry Run: Runtime Estimate ===
+# Assumed max per-OG runtime: 3.00 min
+# Caps: MAX_CONDITION_PAIRS_PER_OG=1000, MAX_TOTAL_SAMPLES_PER_OG=3000
+# [phylum] pending_ogs=892, hit_max_setting=80, max_contexts=3000, weighted_est=9h 34m 50s, hitmax_only=4h 0m 0s, worst_case=44h 36m 0s
+# [domain] pending_ogs=986, hit_max_setting=0, max_contexts=90, weighted_est=8h 25m 20s, hitmax_only=0s, worst_case=49h 18m 0s
+# [class] pending_ogs=986, hit_max_setting=218, max_contexts=3000, weighted_est=12h 26m 46s, hitmax_only=10h 54m 0s, worst_case=49h 18m 0s
+# [order] pending_ogs=986, hit_max_setting=306, max_contexts=3000, weighted_est=23h 33m 30s, hitmax_only=15h 18m 0s, worst_case=49h 18m 0s
+# [family] pending_ogs=986, hit_max_setting=413, max_contexts=3000, weighted_est=26h 17m 59s, hitmax_only=20h 39m 0s, worst_case=49h 18m 0s
+# [genus] pending_ogs=986, hit_max_setting=491, max_contexts=3000, weighted_est=32h 9m 43s, hitmax_only=24h 33m 0s, worst_case=49h 18m 0s
+
+# === Total Estimate ===
+# pending_ogs=5822, hit_max_setting=1508
+# weighted_estimate=112h 28m 9s
+# hitmax_only_estimate=75h 24m 0s
+# worst_case_estimate=291h 6m 0s

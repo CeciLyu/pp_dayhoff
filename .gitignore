@@ -1,2 +1,5 @@
 slurm*
 **/__pycache__/**
+results/*
+**/*.csv
+**/*.pkl
