@@ -356,6 +356,7 @@ def main():
                 }
                 for rank in RANKS:
                     vals = row[col_idx[rank]]
+                    rec[rank] = vals
                     if rank == "species":
                         rec[f"n_unique_{rank}"] = len(
                             set(int(t) for t in row[col_idx["taxid"]])
